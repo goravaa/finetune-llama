@@ -1,0 +1,50 @@
+# ========= GENERAL =========
+general:
+  project_name: "my-llama-finetune"     # shown in logs & W&B
+  seed: 42
+  output_dir: "./outputs"
+  push_to_hub: false                    # publish final model?
+  hub_model_id: null                    # e.g. "username/my-llama"
+  deploy_after_training: false          # run text-gen-inference after fit?
+
+# ========= DATA =========
+dataset:
+  name_or_path: "./data/my_dataset.csv" # local CSV OR Hub name
+  text_column: "text"
+  validation_split_percentage: 5        # % taken for dev set
+
+# ========= MODEL =========
+model:
+  base_model: "meta-llama/Llama-2-7b-hf"
+  load_in_4bit: true        # true  → 4-bit Q enabled
+  quant_type: "nf4"         # nf4 | fp4 | int8
+  compute_dtype: "bfloat16" # bf16/fp16/float32
+  use_lora: true
+  lora_r: 16
+  lora_alpha: 32
+  lora_dropout: 0.05
+
+# ========= TRAINING =========
+training:
+  per_device_train_batch_size: 4
+  gradient_accumulation_steps: 4
+  max_steps: 1_000
+  learning_rate: 2.0e-5
+  lr_scheduler_type: "cosine"
+  warmup_steps: 50
+  bf16: true
+  fp16: false
+  logging_steps: 10
+  save_steps: 200
+  eval_steps: 200
+
+# ========= WANDB =========
+wandb:
+  use_wandb: true
+  project: "llama-playground"
+  entity: "my-team"
+
+# ========= RESOURCE GUARDRAILS =========
+resources:
+  auto_check: true
+  vram_margin_mb: 1024     # keep this free to avoid OOM

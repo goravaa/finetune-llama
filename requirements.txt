@@ -1,0 +1,10 @@
+torch>=2.2.0                       # match your CUDA toolkit
+transformers==4.52.3               # ⬆️ 22 May 2025 
+peft==0.15.2                       # ⬆️ 15 Apr 2025 
+accelerate==1.7.0                  # ⬆️ 15 May 2025 
+bitsandbytes==0.45.5               # ⬆️ 7 Apr 2025 
+datasets==3.6.0                    # ⬆️ 7 May 2025 
+scikit-learn>=1.4.2
+tqdm>=4.66
+PyYAML>=6.0
+wandb>=0.17.0
