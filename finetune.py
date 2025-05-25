@@ -1,109 +1,200 @@
 #!/usr/bin/env python3
 """
-🦙 Universal Llama finetuning launcher
+🦙Llama finetuning launcher
 -------------------------------------
-• Q-only, LoRA-only or full QLoRA
+• Q-only, LoRA-only, full QLoRA, or vanilla FP16/32
 • YAML-driven config
-• Emoji logs
-• Early VRAM check to save time
+• Early VRAM check via dummy profiling to avoid mid-run OOM
+• Hugging Face authentication & model availability checks
 """
-import argparse, os, yaml, torch, random, numpy as np
+import argparse
+import os
+import sys
+import yaml
+import torch
+import random
+import numpy as np
 from utils.logging_utils import setup_logger
 from utils.resource_estimator import check_device_fits
 from transformers import (
-    AutoTokenizer, AutoModelForCausalLM,
-    TrainingArguments, Trainer
+    AutoTokenizer,
+    AutoModelForCausalLM,
+    TrainingArguments,
+    Trainer,
 )
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
-from datasets import load_dataset
+from dataset import prepare_dataset
+from inference import run_inference
+from huggingface_hub import HfApi, HfFolder
 
 log = setup_logger()
 
 # ---------- helpers ----------
 def set_seed(seed):
-    random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+
 
 def load_yaml(path):
     with open(path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
+
+
+def check_hf_login():
+    token = HfFolder.get_token()
+    if not token:
+        log.error(
+            "🔒 No Hugging Face token found. "
+            "Run `huggingface-cli login` or set HUGGINGFACE_TOKEN."
+        )
+        sys.exit(1)
+    try:
+        HfApi().whoami(token=token)
+        log.info("✅ Hugging Face authentication OK")
+    except Exception as e:
+        log.error(f"🔒 Hugging Face auth failed: {e}")
+        sys.exit(1)
+
+
+def verify_model_access(repo_id: str):
+    try:
+        HfApi().model_info(repo_id)
+        log.info(f"✅ Access confirmed for model {repo_id}")
+    except Exception:
+        log.error(
+            f"❌ Cannot load model '{repo_id}'. "
+            "Check name/access rights or HF_TOKEN scopes."
+        )
+        sys.exit(1)
 
 # ---------- main ----------
 def main(cfg_path):
     cfg = load_yaml(cfg_path)
     set_seed(cfg["general"]["seed"])
 
-    # ① Resource sanity check
-    if cfg["resources"]["auto_check"]:
-        ok, want, free = check_device_fits(cfg, cfg["resources"]["vram_margin_mb"])
-        if not ok:
-            log.error(f"Need ≈{want//1024} GB, only {free//1024} GB free ‼️  – consider ↓batch or ↑quant")
-            return
-        log.info(f"Resource check ✅  (need {want//1024} GB, have {free//1024} GB)")
+    # 0️⃣ HF login & model access
+    base = cfg["model"]["base_model"]
+    if cfg["general"].get("push_to_hub", False) or "huggingface" in base:
+        check_hf_login()
+        verify_model_access(base)
 
-    # ② Data
-    data_cfg = cfg["dataset"]
-    if os.path.isfile(data_cfg["name_or_path"]) and data_cfg["name_or_path"].endswith(".csv"):
-        ds = load_dataset("csv", data_files=data_cfg["name_or_path"])
-    else:
-        ds = load_dataset(data_cfg["name_or_path"])
-    ds = ds["train"].train_test_split(test_size=data_cfg["validation_split_percentage"]/100.0)
-    log.info(f"Dataset loaded with {len(ds['train'])} train / {len(ds['test'])} val samples")
+    # ① Dataset preparation
+    ds = prepare_dataset(cfg["dataset"])
+    log.info(
+        f"Dataset prepared: {len(ds['train'])} train / {len(ds['test'])} val samples"
+    )
 
-    # ③ Tokeniser & Model
-    quant = cfg["model"]["load_in_4bit"]
-    lora  = cfg["model"]["use_lora"]
+    # ② Tokenizer & Model loading
+    quant = cfg["model"].get("load_in_4bit", False)
+    eight_bit = cfg["model"].get("load_in_8bit", False)
+    use_lora = cfg["model"].get("use_lora", False)
+
+    if not any([quant, eight_bit, use_lora]):
+        log.info(
+            "🛣️ Running vanilla full-precision fine-tuning (no quant, no LoRA)"
+        )
+
     model_kwargs = {}
-    if quant:
-        model_kwargs.update({
-            "load_in_4bit": True,
-            "bnb_4bit_compute_dtype": getattr(torch, cfg["model"]["compute_dtype"]),
-            "bnb_4bit_quant_type": cfg["model"]["quant_type"],
-        })
-    tokenizer = AutoTokenizer.from_pretrained(cfg["model"]["base_model"], use_fast=True)
-    tokenizer.pad_token = tokenizer.eos_token
-    model = AutoModelForCausalLM.from_pretrained(cfg["model"]["base_model"], **model_kwargs)
+    if quant or eight_bit:
+        if quant:
+            model_kwargs = {
+                "load_in_4bit": True,
+                "bnb_4bit_compute_dtype": getattr(
+                    torch, cfg["model"]["compute_dtype"]
+                ),
+                "bnb_4bit_quant_type": cfg["model"]["quant_type"],
+            }
+        else:
+            model_kwargs = {"load_in_8bit": True}
 
-    # ③-bis LoRA
-    if lora:
-        model = prepare_model_for_kbit_training(model) if quant else model
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(
+            base, use_fast=True
+        )
+        tokenizer.pad_token = tokenizer.eos_token
+        model = AutoModelForCausalLM.from_pretrained(
+            base, **model_kwargs
+        )
+    except Exception as e:
+        log.error(f"❌ Failed to load model/tokenizer: {e}")
+        sys.exit(1)
+
+    # ③ LoRA injection
+    if use_lora:
+        if quant or eight_bit:
+            model = prepare_model_for_kbit_training(model)
+        targets = cfg["model"].get(
+            "lora_target_modules", ["q_proj", "v_proj", "k_proj", "o_proj"]
+        )
         lora_cfg = LoraConfig(
             r=cfg["model"]["lora_r"],
             lora_alpha=cfg["model"]["lora_alpha"],
-            target_modules=["q_proj", "v_proj", "k_proj", "o_proj"],
+            target_modules=targets,
             lora_dropout=cfg["model"]["lora_dropout"],
-            bias="none",
-            task_type="CAUSAL_LM",
+            bias=cfg["model"].get("lora_bias", "none"),
+            task_type=cfg["model"].get("lora_task_type", "CAUSAL_LM"),
         )
         model = get_peft_model(model, lora_cfg)
-        log.info("LoRA adapters injected ✨")
+        log.info(f"LoRA adapters injected into: {targets} ✨")
 
-    # ④ Training arguments
+    # ④ VRAM check
+    if cfg.get("resources", {}).get("auto_check", False):
+        seq_len = cfg["resources"].get("dummy_seq_len", 512)
+        margin = cfg["resources"].get("vram_margin_mb", 0)
+        ok, want, free = check_device_fits(
+            model, cfg, margin, seq_len
+        )
+        if not ok:
+            log.error(
+                f"Need ≈{want//1024} GB, only {free//1024} GB free ‼️"
+                " Adjust batch/seq_len/quant/LoRA"
+            )
+            return
+        log.info(
+            f"Resource check ✅ (need {want//1024} GB, have {free//1024} GB)"
+        )
+
+    # ⑤ TrainingArguments
+    reporters = []
+    if cfg.get("wandb", {}).get("use_wandb", False):
+        reporters.append("wandb")
+    if cfg.get("logging", {}).get("use_tensorboard", False):
+        reporters.append("tensorboard")
+
     targs = TrainingArguments(
         output_dir=cfg["general"]["output_dir"],
-        per_device_train_batch_size=cfg["training"]["per_device_train_batch_size"],
-        gradient_accumulation_steps=cfg["training"]["gradient_accumulation_steps"],
+        per_device_train_batch_size=
+            cfg["training"]["per_device_train_batch_size"],
+        gradient_accumulation_steps=
+            cfg["training"]["gradient_accumulation_steps"],
         max_steps=cfg["training"]["max_steps"],
         learning_rate=cfg["training"]["learning_rate"],
         lr_scheduler_type=cfg["training"]["lr_scheduler_type"],
         warmup_steps=cfg["training"]["warmup_steps"],
-        bf16=cfg["training"]["bf16"],
-        fp16=cfg["training"]["fp16"],
+        bf16=cfg["training"].get("bf16", False),
+        fp16=cfg["training"].get("fp16", False),
         logging_steps=cfg["training"]["logging_steps"],
         save_steps=cfg["training"]["save_steps"],
         evaluation_strategy="steps",
         eval_steps=cfg["training"]["eval_steps"],
-        report_to=["wandb"] if cfg["wandb"]["use_wandb"] else [],
+        report_to=reporters,
+        logging_dir=cfg.get("logging", {}).get("tb_log_dir"),
         run_name=cfg["general"]["project_name"],
-        push_to_hub=cfg["general"]["push_to_hub"],
-        hub_model_id=cfg["general"]["hub_model_id"],
+        push_to_hub=cfg["general"].get("push_to_hub", False),
+        hub_model_id=cfg["general"].get("hub_model_id"),
     )
 
-    # ⑤ Data collator (simple, causal LM)
+    # ⑥ Data collator & Trainer
     def collate_fn(batch):
-        toks = tokenizer([b[data_cfg["text_column"]] for b in batch],
-                         truncation=True, padding="max_length",
-                         max_length=tokenizer.model_max_length, return_tensors="pt")
+        toks = tokenizer(
+            [b[cfg["dataset"]["text_column"]] for b in batch],
+            truncation=True,
+            padding="max_length",
+            max_length=tokenizer.model_max_length,
+            return_tensors="pt",
+        )
         toks["labels"] = toks["input_ids"].clone()
         return toks
 
@@ -115,19 +206,19 @@ def main(cfg_path):
         data_collator=collate_fn,
     )
 
-    # ⑥ GO!
+    # ⑦ Train
     log.info("🚀 Starting training loop …")
     trainer.train()
     log.info("✅ Training complete")
 
-    # ⑦ Push / deploy
-    if cfg["general"]["push_to_hub"]:
-        log.info("📤 Pushing adapter to 🤗 Hub …")
+    # ⑧ Push & deploy
+    if cfg["general"].get("push_to_hub", False):
+        log.info("📤 Pushing to Hugging Face Hub …")
         trainer.push_to_hub()
+    if cfg["general"].get("deploy_after_training", False):
+        log.info("⚡ Running inference…")
+        run_inference(cfg)
 
-    if cfg["general"]["deploy_after_training"]:
-        log.info("⚡ Spinning up text-generation-inference … (stub)")
-        #  -> call `tii` docker / hf-inference endpoints here
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

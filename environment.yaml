@@ -1,0 +1,23 @@
+name: llama-trainer
+channels:
+  - defaults
+  - conda-forge
+dependencies:
+  - python>=3.10
+  - pip
+  - pytorch>=2.2.0
+  - cudatoolkit=12.1  # match your GPU
+  - pip:
+      - transformers==4.52.3
+      - peft==0.15.2
+      - accelerate==1.7.0
+      - bitsandbytes==0.45.5
+      - datasets==3.6.0
+      - huggingface_hub>=0.18.0
+      - scikit-learn>=1.4.2
+      - tqdm>=4.66
+      - PyYAML>=6.0
+      - wandb>=0.17.0
+      - gradio>=3.40.0       # for web dashboard
+      - optimum>=1.14.0      # for compression export
+      - sentencepiece>=0.1.99  # required by many tokenizers
